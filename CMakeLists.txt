@@ -33,7 +33,7 @@ endif()
 set(Boost_USE_STATIC_LIBS        ON)
 set(Boost_USE_MULTITHREADED      ON)
 set(Boost_USE_STATIC_RUNTIME    OFF)
-find_package(Boost COMPONENTS date_time regex REQUIRED)
+find_package(Boost 1.66 COMPONENTS date_time regex REQUIRED)
 #Boost is a giant beast, not going to auto download it like googletest...
 
 if (WIN32)

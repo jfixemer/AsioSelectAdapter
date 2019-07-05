@@ -33,3 +33,6 @@
 
 # Editor integration
 .vscode
+
+# CMAKE
+build/

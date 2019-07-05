@@ -7,141 +7,195 @@
 // to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
-// 
+//
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
 #include <boost/asio.hpp>
+#include <boost/asio/posix/descriptor.hpp>
+#include <memory>
+#include <sys/select.h>
+#include <sys/time.h>
 
 namespace adapter
 {
-namespace asio=boost::asio;
+namespace asio = boost::asio;
 
-template <class ASIO_SOCKET_T>
-class AsioSelect
+// AsioSelect allows Asio to dispatch events designed to integrate with
+// BSD sockets and select.
+
+class AsioSelect : std::enable_shared_from_this<AsioSelect>
 {
-
 public:
-    using socket_t = typename ASIO_SOCKET_T; // e.g. [boost::]asio::udp_socket or tcp_socket, etc.
-    using socket_up = std::unique_ptr<socket_t>;
-    using tracker_t = std::vector<socket_up>;
-    using native_fd_t = typename socket_t::native_handle_type;
-    using protocol_type = typename socket_t::protocol_type;
-
-    AsioSelect()
+    class device_t : public asio::posix::descriptor
     {
-        FD_ZERO(&m_waiting);
+        using parent = asio::posix::descriptor;
+        public:
+            device_t(asio::io_context& ctx) : parent(ctx) {}
+            device_t(asio::io_context& ctx, const native_handle_type& fd) : parent(ctx, fd) {}
+            device_t(device_t&& other) : parent(std::move(other)) {}
+            ~device_t() = default;
+    };
+
+    using native_fd_t = typename asio::posix::descriptor::native_handle_type;
+    using timer_t = asio::steady_timer;
+    using clock_t = timer_t::clock_type;
+    using duration_t = timer_t::duration;
+    using time_point_t = timer_t::time_point;
+    using error_code_t = boost::system::error_code;
+    using tracker_t = std::map<native_fd_t, device_t>;
+    using max_fd=native_fd_t;
+    using blocking=int;
+    using select_cb_t = std::function<int(max_fd*, fd_set*, struct timeval*, blocking*)>;
+    using dispatch_cb_t = std::function<int(int num_ready, fd_set*, error_code_t)>;
+
+    enum class EVENT
+    {
+        fd_read,
+        timeout
+    };
+
+    inline static std::shared_ptr<AsioSelect> make(asio::io_context& io)
+    {
+        return std::make_shared<AsioSelect>(io);
     }
 
-    // Creates a socket for the FD.
-    // use prepare async_read
-    // use get for async_write
-    void add(native_fd_t fd)
+    void setup(dispatch_cb_t disp, select_cb_t sel)
     {
-        if (tracker_.size() < fd)
-            tracker_.resize(fd);
-
-        if (!tracker_[fd])
-        {
-            FD_CLR(fd, &m_waiting); // defensive.
-            tracker_[fd].reset(new socket_t(io_, protocol_type::v4(), fd));
-        }
+        on_dispatch_ = std::move(disp);
+        on_select_ = std::move(sel);
+        update();
     }
 
-    // WARNING: Does not audit (remove unset fds)
-    // WARNING: Creates a copy of callback for every new fd
-    // Order of audit and add_wait is not too crucial, but 
-    // add_wait, then audit may avoid memory relocation in audit.
-    void add(fd_set& fdset, int maxfd)
-    {
-        // Expectation: maxfd-1 in the fdset is true.
-        if (tracker_.size() < maxfd)
-            tracker_.resize(maxfd);
+    bool is_waiting(native_fd_t fd) { return FD_ISSET(fd, &m_read_waiting); }
+    bool empty() { return tracker_.empty(); }
+    size_t size() { return tracker_.size(); }
 
-        for(int fd = 0; fd < maxfd; ++fd)
-        {
-            if(FD_ISSET(fd, fdset))
-                add_wait(fd, [fd, callback](std::system_error ec){callback(ec, fd);});
-        }
+    void update()
+    {
+        if (on_select_)
+            update(on_select_);
     }
+
+    void update(select_cb_t& get_select_info)
+    {
+
+        int max_fds = 0;
+        fd_set fds;
+        FD_ZERO(&fds);
+        timeval tv = { 0, 0 };
+        int blocking = 1;
+        get_select_info(&max_fds, &fds, &tv, &blocking);
+
+        audit_read(fds, max_fds);
+        add_read(fds, max_fds);
+        if (!blocking)
+            audit_timeout(std::chrono::seconds(tv.tv_sec) + std::chrono::milliseconds(tv.tv_usec));
+    }
+
+    AsioSelect(asio::io_context& io)
+        : asio_io_(io)
+        , select_timer_(io)
+    {
+        FD_ZERO(&m_read_waiting);
+    }
+private:
 
     // removes all fds not set in the fdset.
-    // WARNING: does not add any fds not already tracked.  use add_wait.
-    void audit(fd_set& fdset, int maxfd) 
-    { 
-        size_t counter = 0;
-        for(auto& uptr : tracker_)
+    void audit_read(fd_set& fdset, native_fd_t max_fd)
+    {
+        for (auto iter = tracker_.begin(), last = tracker_.end(); iter != last;)
         {
-            if( (counter > maxfd || !FD_ISSET(counter, m_waiting)) && tracker_[counter])
-                close_impl(counter);
-            ++counter;
+            if ((*iter).first > max_fd || !FD_ISSET((*iter).first, &fdset))
+                iter = tracker_.erase(iter);
+            else
+                ++iter;
         }
-        compact();
     }
 
-
-    void close(int fd)
+    void audit_timeout(duration_t new_timer_duration)
     {
-        close_impl(fd);
-        compact();
+        timer_t new_timer(asio_io_, new_timer_duration); // handles now() + duration.
+        auto current_tmo = select_timer_.expiry();
+        auto new_tmo = new_timer.expiry();
+        auto five_ms = std::chrono::milliseconds(5);
+        // Most likely cases are
+        //  - timer is not running (current_tmo == epoch time_point), don't try to subtract from
+        //  that btw.
+        //  - timeout is the same timer as last time (+/- some processing delay getting to this
+        //  point)
+        if ((current_tmo < (new_tmo - five_ms)) || (current_tmo > (new_tmo + five_ms)))
+        {
+            auto self(shared_from_this());
+            select_timer_ = std::move(new_timer);
+            select_timer_.async_wait([this, self](error_code_t ec) {
+                if (!ec)
+                {
+                    // set to epoch to indicate already expired.
+                    // set before dispatching so that reschedule works.
+                    select_timer_.expires_at(time_point_t());
+                    dispatch(ec, EVENT::timeout, 0);
+                }
+            });
+        }
     }
 
-    // WARNING: can return nullptr (for fds we don't manage)
-    // WARNING: returns the raw socket pointer (you don't own it, don't delete it)
-    socket_t* get(int fd)
+    void add_read(fd_set& fdset, int maxfd)
     {
-        if(fd >= tracker_.size())
-            return nullptr;
-        
-        return tracker_[fd].get();
+        auto self(shared_from_this());
+        for (int fd = 0; fd < maxfd; ++fd)
+        {
+            if (FD_ISSET(fd, &fdset) && !FD_ISSET(fd, &m_read_waiting))
+            {
+                // Create if missing
+                auto end = tracker_.end();
+                auto iter = tracker_.lower_bound(fd);
+                // Is iter the item or just an insert hint?
+                if ((iter == end) || (fd != iter->first))
+                {
+                    iter = tracker_.insert(iter, tracker_t::value_type{fd, device_t{asio_io_, fd}});
+                }
+
+                // Add the wait function
+                FD_SET(fd, &m_read_waiting);
+
+                iter->second.async_wait(device_t::wait_read, [this, self, fd](error_code_t ec) {
+                    // Clear the wait in the lambda because dispatch also handles timeout.
+                    FD_CLR(fd, &m_read_waiting);
+                    dispatch(ec, EVENT::fd_read, fd);
+                });
+            }
+        }
     }
 
-    // WARNING: Can only be called once 
-    // (then it becomes a waiting socket, cannot prepared again until dispatched)
-    socket_t* prepare_async(int fd)
+    void dispatch(error_code_t ec, EVENT event, native_fd_t fd)
     {
-        if(fd >= tracker_.size() || !tracker_[fd])
-            return nullptr;
+        if (on_dispatch_)
+        {
+            fd_set dispatch;
+            FD_ZERO(&dispatch);
+            int num_fds = 0;
+            if (event == EVENT::fd_read)
+            {
+                FD_SET(fd, &dispatch);
+                num_fds = 1;
+            }
 
-        if( FD_ISSET(fd, &m_waiting))
-            return nullptr;
-
-        FD_SET(fd, &m_waiting);
-        return tracker_[fd].get();
+            if(on_dispatch_(num_fds, &dispatch, ec) < 0)
+                asio_io_.stop();
+        }
+        if (on_select_)
+        {
+            update(on_select_);
+        }
     }
+    
 
-    void is_waiting(int fd) { return FD_ISSET(fd, &m_waiting); }
-
-    int size() { return (int)tracker_.size(); }
-
-    void update(fd_set& fdset, int maxfd)
-    {
-        add(fdset, maxfd);
-        audit(fdset);
-    }
-
-
-private:
-    void close_impl(int fd)
-    {
-        FD_CLR(fd, &m_waiting);
-        if (tracker_[fd])
-            tracker_[fd].reset(nullptr);
-    }
-
-    void compact(void)
-    {
-        auto is_uptr_null = [](const socket_up& item) -> bool { return item; };
-        auto last_not_null
-            = std::find_if(tracker_.crbegin(), tracker_.crend(), is_uptr_null).base();
-
-        if (last_not_null != tracker_.end())
-            tracker_.erase((++last_not_null), tracker_.end());
-
-    }
-
-    asio::io_context io_;
-    fd_set m_waiting;
-    std::vector<std::unique_ptr<socket_t>> tracker_;
+    asio::io_context& asio_io_;
+    timer_t select_timer_;
+    select_cb_t on_select_;
+    dispatch_cb_t on_dispatch_;
+    tracker_t tracker_;
+    fd_set m_read_waiting;
 };
 
 }
