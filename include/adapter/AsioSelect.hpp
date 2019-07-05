@@ -16,6 +16,29 @@
 #include <sys/select.h>
 #include <sys/time.h>
 
+#ifdef ASIO_SELECT_TRACE
+#include <iostream>
+struct fd_set_nr
+{
+    int max;
+    fd_set& fds;
+};
+
+std::ostream& operator<<(std::ostream& os, const fd_set_nr& sn)
+{
+    const char* sep = "";
+    os << "max_fd=" << sn.max;
+    os << ", fdset=[";
+    for(int i = 0; i < sn.max + 1; ++i)
+        if(FD_ISSET(i, &sn.fds))
+        {
+            os << sep << i;
+            sep = ", ";
+        }
+    os << "]";
+    return os;
+}
+#endif
 namespace adapter
 {
 namespace asio = boost::asio;
@@ -103,6 +126,9 @@ private:
     // removes all fds not set in the fdset.
     void audit_read(fd_set& fdset, native_fd_t max_fd)
     {
+#       ifdef ASIO_SELECT_TRACE
+        std::cerr << "TRACE audit_read:  " << fd_set_nr{max_fd, fdset} << std::endl;
+#       endif
         for (auto iter = tracker_.begin(), last = tracker_.end(); iter != last;)
         {
             if ((*iter).first > max_fd || !FD_ISSET((*iter).first, &fdset))
@@ -114,6 +140,9 @@ private:
 
     void audit_timeout(duration_t new_timer_duration)
     {
+#       ifdef ASIO_SELECT_TRACE
+        std::cerr << "TRACE audit_timeout:  " <<  new_timer_duration.count() << std::endl;
+#       endif
         timer_t new_timer(asio_io_, new_timer_duration); // handles now() + duration.
         auto current_tmo = select_timer_.expiry();
         auto new_tmo = new_timer.expiry();
@@ -141,11 +170,18 @@ private:
 
     void add_read(fd_set& fdset, int maxfd)
     {
+#       ifdef ASIO_SELECT_TRACE
+        std::cerr << "TRACE add_read:  " << fd_set_nr{maxfd, fdset} << std::endl;
+#       endif
         auto self(shared_from_this());
+        ++maxfd;
         for (int fd = 0; fd < maxfd; ++fd)
         {
             if (FD_ISSET(fd, &fdset) && !FD_ISSET(fd, &m_read_waiting))
             {
+#               ifdef ASIO_SELECT_TRACE
+                std::cerr << "TRACE add_read+create: fd=" << fd << std::endl;
+#               endif
                 // Create if missing
                 auto end = tracker_.end();
                 auto iter = tracker_.lower_bound(fd);
