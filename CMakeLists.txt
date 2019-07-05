@@ -59,6 +59,9 @@ if (WIN32)
     add_definitions(-D_WIN32_WINNT=${ver})
 endif(WIN32)
 
+add_library(selectadapter STATIC source/AsioSelect.cpp)
+target_include_directories(selectadapter PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
 enable_testing()
 add_subdirectory(test)
 

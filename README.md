@@ -1,18 +1,23 @@
 # AsioSelectAdapter
 Helps applications using fd_set integrate with ASIO.  
 
-Keywords: Header Only, C++11, ASIO, select, fd_set
-
-Status: Compiles, insufficient tests
-
-@TODO: Add Useful testcases
+Status: Basically working.  Your mileage may vary.
 
 Goal is to convert and old, select based event loop to a new event loop run by ASIO.
+
+Building:
+ - copy adapter/AsioSelect.hpp and source/AdpterSelect.cpp into your project. --or--
+ - Use this project's CMake configuration: 
+   - include: %ROOT%/include, 
+   - link: %BUILD%/libselectadapter.a
+
+Why not header only:  I don't fully understand the voodoo of this strategy and would probably
+create something that wouldn't offer the inlining and optimization benefits.
 
 Why: This is up to you but some of the items:
  - modernization, moving from select to a poll/epoll system
  - modernization, moving toward future C++ NetworkTS compilance
- - wanting to add HTTP services with Beast (REST, WebSockets)
+ - wanting to add Other network or HTTP services with Asio/Beast (REST, WebSockets)
 
 What this does not do:
  - Provide portability to Windows (because asio::posix is not enabled on Windows)
@@ -56,10 +61,10 @@ int main(...)
 }
 ```
 
-This would transform into:
+This would transform into  A helper function / functor / lambda and a modified 'main' loop based
+on asio io/executor.run() 
 
-A helper function, possibly a static function beside main but shown as an external
-here to illustrate that the wrapper function doesn't need the AsioSelect.hpp included.
+Helper function:
 ```c++
 #include <sys/select.h>
 #include <boost/system/error_codes.hpp>
@@ -77,7 +82,7 @@ int legacy_dispatch_wrapper(int num_ready, fd_set* read_fd_set, boost::system::e
         legacy_read(read_fd_set);
 }
 ```
-The modified event loop...
+The modified 'main' event loop...
 ```c++
 
 #include "adapter/AsioSelect.hpp"
@@ -98,3 +103,4 @@ int main(...)
     asio_io.run();
 }
 ```
+
