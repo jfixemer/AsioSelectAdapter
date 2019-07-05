@@ -23,7 +23,7 @@ namespace asio = boost::asio;
 // AsioSelect allows Asio to dispatch events designed to integrate with
 // BSD sockets and select.
 
-class AsioSelect : std::enable_shared_from_this<AsioSelect>
+class AsioSelect : public std::enable_shared_from_this<AsioSelect>
 {
 public:
     class device_t : public asio::posix::descriptor

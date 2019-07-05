@@ -11,15 +11,8 @@
 
 struct LegacyWrapper
 {
-    // This would be incidental tracking in the third party
-    // maybe even buried in a subsctruct or list of sessions, etc.
-    // Some libraries may even track this as (!)global data(!).
-    std::vector<int> sockets;
-    std::vector<sockaddr_in> addrs;
-
-    static void global(LegacyWrapper*);
-    static LegacyWrapper& instance();
-
+    static LegacyWrapper* instance();
+    
     MOCK_METHOD4(select_info, int(int* num_fds, fd_set* fds, struct timeval* tv, int* blocking));
     MOCK_METHOD2(dispatch, int(int num_ready, fd_set* read_fds));
     MOCK_METHOD1(read, void(fd_set* read_fds));
@@ -29,6 +22,10 @@ struct LegacyWrapper
     //void dispatch(int num_ready, fd_set* read_fds);
     //void read(fd_set* read_fds);
     //void timeout();
+
+    LegacyWrapper();
+    ~LegacyWrapper();
+    LegacyWrapper* last_global;
 };
 
 
